@@ -3,9 +3,15 @@ name: Push Daily SEO Brief to Telegram
 on:
   push:
     paths:
-      - 'reports/**.md'   # 只有 reports 目录有新文件时才触发
+      - 'reports/**.md'
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      report_date:
+        description: '指定日期（格式：YYYY-MM-DD），留空则使用最新文件'
+        required: false
+        default: ''
 
 jobs:
   send-to-telegram:
@@ -15,64 +21,93 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2   # 获取最近两次 commit，用于 diff
+          fetch-depth: 2
 
-      - name: Get new report file
+      - name: Get report file
         id: get_file
         run: |
-          # 获取本次 push 新增的 md 文件路径
-          NEW_FILE=$(git diff --name-only HEAD~1 HEAD -- 'reports/*.md' | head -n 1)
-          echo "file=$NEW_FILE" >> $GITHUB_OUTPUT
+          INPUT_DATE="${{ github.event.inputs.report_date }}"
 
-      - name: Read report content
-        id: read_report
-        run: |
-          FILE="${{ steps.get_file.outputs.file }}"
-          if [ -z "$FILE" ]; then
-            echo "No new report file found, skipping."
-            exit 0
+          if [ -n "$INPUT_DATE" ]; then
+            NEW_FILE="reports/$INPUT_DATE.md"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            NEW_FILE=$(ls reports/*.md 2>/dev/null | sort | tail -n 1)
+          else
+            NEW_FILE=$(git diff --name-only HEAD~1 HEAD -- 'reports/*.md' | head -n 1)
           fi
-          # 读取内容，Telegram 单条消息上限 4096 字符
-          CONTENT=$(cat "$FILE")
-          echo "content<<EOF" >> $GITHUB_OUTPUT
-          echo "$CONTENT" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+
+          if [ -z "$NEW_FILE" ]; then
+            echo "No report file found, exiting."
+            exit 1
+          fi
+
+          if [ ! -f "$NEW_FILE" ]; then
+            echo "File $NEW_FILE does not exist, exiting."
+            exit 1
+          fi
+
+          echo "file=$NEW_FILE" >> $GITHUB_OUTPUT
+          echo "Using file: $NEW_FILE"
 
       - name: Send to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REPORT_FILE: ${{ steps.get_file.outputs.file }}
         run: |
-          FILE="${{ steps.get_file.outputs.file }}"
-          if [ -z "$FILE" ]; then exit 0; fi
-
-          # 提取日期作为标题
-          DATE=$(basename "$FILE" .md)
-          CONTENT=$(cat "$FILE")
-
-          # Telegram 单条上限 4096 字，超长则分段发送
           python3 << 'PYEOF'
-          import os, requests, textwrap
+          import os
+          import requests
 
           token = os.environ["TELEGRAM_BOT_TOKEN"]
           chat_id = os.environ["TELEGRAM_CHAT_ID"]
-          date = os.popen('basename "${{ steps.get_file.outputs.file }}" .md').read().strip()
+          report_file = os.environ["REPORT_FILE"]
 
-          with open("${{ steps.get_file.outputs.file }}", "r") as f:
+          with open(report_file, "r", encoding="utf-8") as f:
               content = f.read()
+
+          # 提取日期作为开头标题
+          date = os.path.basename(report_file).replace(".md", "")
+          header = f"📋 *每日 SEO 情报简报 — {date}*\n\n"
+          content = header + content
 
           url = f"https://api.telegram.org/bot{token}/sendMessage"
 
-          # 按 4000 字符分段（留余量）
-          chunks = textwrap.wrap(content, width=4000, break_long_words=False, break_on_hyphens=False)
+          # Telegram 单条消息上限 4096 字符，按 4000 分段保留余量
+          MAX_LEN = 4000
+          chunks = []
+          while len(content) > MAX_LEN:
+              # 尽量在换行处截断
+              split_pos = content.rfind('\n', 0, MAX_LEN)
+              if split_pos == -1:
+                  split_pos = MAX_LEN
+              chunks.append(content[:split_pos])
+              content = content[split_pos:].lstrip('\n')
+          if content:
+              chunks.append(content)
+
+          total = len(chunks)
+          print(f"Total chunks to send: {total}")
 
           for i, chunk in enumerate(chunks):
-              part_label = f"（第 {i+1}/{len(chunks)} 部分）\n\n" if len(chunks) > 1 else ""
+              part_label = f"（{i+1}/{total}）\n\n" if total > 1 else ""
               payload = {
                   "chat_id": chat_id,
                   "text": part_label + chunk,
                   "parse_mode": "Markdown"
               }
-              r = requests.post(url, json=payload)
-              print(r.status_code, r.text)
+              response = requests.post(url, json=payload)
+              print(f"Chunk {i+1}: status={response.status_code}")
+
+              # 如果 Markdown 解析失败，降级为纯文本重试
+              if response.status_code != 200:
+                  print(f"Markdown failed, retrying as plain text...")
+                  payload["parse_mode"] = ""
+                  response = requests.post(url, json=payload)
+                  print(f"Chunk {i+1} retry: status={response.status_code}, body={response.text}")
+
+              if response.status_code != 200:
+                  raise Exception(f"Failed to send chunk {i+1}: {response.text}")
+
+          print("All chunks sent successfully.")
           PYEOF
