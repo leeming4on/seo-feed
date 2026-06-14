@@ -1,0 +1,78 @@
+name: Push Daily SEO Brief to Telegram
+
+on:
+  push:
+    paths:
+      - 'reports/**.md'   # 只有 reports 目录有新文件时才触发
+    branches:
+      - main
+
+jobs:
+  send-to-telegram:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2   # 获取最近两次 commit，用于 diff
+
+      - name: Get new report file
+        id: get_file
+        run: |
+          # 获取本次 push 新增的 md 文件路径
+          NEW_FILE=$(git diff --name-only HEAD~1 HEAD -- 'reports/*.md' | head -n 1)
+          echo "file=$NEW_FILE" >> $GITHUB_OUTPUT
+
+      - name: Read report content
+        id: read_report
+        run: |
+          FILE="${{ steps.get_file.outputs.file }}"
+          if [ -z "$FILE" ]; then
+            echo "No new report file found, skipping."
+            exit 0
+          fi
+          # 读取内容，Telegram 单条消息上限 4096 字符
+          CONTENT=$(cat "$FILE")
+          echo "content<<EOF" >> $GITHUB_OUTPUT
+          echo "$CONTENT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Send to Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          FILE="${{ steps.get_file.outputs.file }}"
+          if [ -z "$FILE" ]; then exit 0; fi
+
+          # 提取日期作为标题
+          DATE=$(basename "$FILE" .md)
+          CONTENT=$(cat "$FILE")
+
+          # Telegram 单条上限 4096 字，超长则分段发送
+          python3 << 'PYEOF'
+          import os, requests, textwrap
+
+          token = os.environ["TELEGRAM_BOT_TOKEN"]
+          chat_id = os.environ["TELEGRAM_CHAT_ID"]
+          date = os.popen('basename "${{ steps.get_file.outputs.file }}" .md').read().strip()
+
+          with open("${{ steps.get_file.outputs.file }}", "r") as f:
+              content = f.read()
+
+          url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+          # 按 4000 字符分段（留余量）
+          chunks = textwrap.wrap(content, width=4000, break_long_words=False, break_on_hyphens=False)
+
+          for i, chunk in enumerate(chunks):
+              part_label = f"（第 {i+1}/{len(chunks)} 部分）\n\n" if len(chunks) > 1 else ""
+              payload = {
+                  "chat_id": chat_id,
+                  "text": part_label + chunk,
+                  "parse_mode": "Markdown"
+              }
+              r = requests.post(url, json=payload)
+              print(r.status_code, r.text)
+          PYEOF
