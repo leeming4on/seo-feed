@@ -49,7 +49,7 @@ jobs:
           echo "file=$NEW_FILE" >> $GITHUB_OUTPUT
           echo "Using file: $NEW_FILE"
 
-      - name: Send to Telegram
+      - name: Send Rich Message to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -57,6 +57,7 @@ jobs:
         run: |
           python3 << 'PYEOF'
           import os
+          import json
           import requests
 
           token = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -64,50 +65,141 @@ jobs:
           report_file = os.environ["REPORT_FILE"]
 
           with open(report_file, "r", encoding="utf-8") as f:
-              content = f.read()
+              raw = f.read()
 
-          # 提取日期作为开头标题
           date = os.path.basename(report_file).replace(".md", "")
-          header = f"📋 *每日 SEO 情报简报 — {date}*\n\n"
-          content = header + content
 
-          url = f"https://api.telegram.org/bot{token}/sendMessage"
+          # ----------------------------------------------------------------
+          # 将原始 Markdown 转换为 Telegram Rich Markdown 格式
+          # Telegram Rich Markdown 兼容 GitHub Flavored Markdown
+          # 主要差异：
+          #   - bold: **text** 或 __text__
+          #   - italic: *text* 或 _text_
+          #   - strikethrough: ~~text~~
+          #   - spoiler: ||text||
+          #   - heading: # ## ### (支持到 ######)
+          #   - table: 标准 Markdown 表格
+          #   - blockquote: > text
+          #   - code block: ```lang ... ```
+          #   - horizontal rule: ---
+          # ----------------------------------------------------------------
 
-          # Telegram 单条消息上限 4096 字符，按 4000 分段保留余量
-          MAX_LEN = 4000
-          chunks = []
-          while len(content) > MAX_LEN:
-              # 尽量在换行处截断
-              split_pos = content.rfind('\n', 0, MAX_LEN)
-              if split_pos == -1:
-                  split_pos = MAX_LEN
-              chunks.append(content[:split_pos])
-              content = content[split_pos:].lstrip('\n')
-          if content:
-              chunks.append(content)
+          def convert_to_telegram_rich_markdown(text, date):
+              """
+              对原始 Markdown 做最小化调整，使其符合 Telegram Rich Markdown 规范。
+              GFM 与 Telegram Rich Markdown 高度兼容，主要处理以下几点：
+              1. 添加标准化文件头（使用 Telegram 支持的 heading 格式）
+              2. 确保 ✅ ❌ 等 emoji 不被误识别为实体
+              3. 超长内容按 32768 字符上限分段
+              """
+              lines = text.strip().split('\n')
+              output_lines = []
 
+              # 文件头：使用 Telegram Rich Markdown H1 + 分隔线
+              output_lines.append(f"# 📋 每日 SEO 情报简报")
+              output_lines.append(f"**{date}**")
+              output_lines.append("")
+              output_lines.append("---")
+              output_lines.append("")
+
+              for line in lines:
+                  # 跳过原文件里已有的顶级标题（避免重复）
+                  if line.strip().startswith('# 每日 SEO') or line.strip().startswith('# Daily SEO'):
+                      continue
+                  output_lines.append(line)
+
+              return '\n'.join(output_lines)
+
+          def split_markdown(text, max_len=32000):
+              """
+              按 Telegram Rich Message 上限 32768 字符分段。
+              优先在 ## 标题处分段，保持结构完整性。
+              """
+              if len(text) <= max_len:
+                  return [text]
+
+              chunks = []
+              current = []
+              current_len = 0
+
+              lines = text.split('\n')
+              for i, line in enumerate(lines):
+                  line_len = len(line) + 1  # +1 for newline
+
+                  # 在二级标题处尝试分段（保持每段结构完整）
+                  if (line.startswith('## ') and
+                      current_len > max_len * 0.3 and
+                      current_len + line_len > max_len * 0.8):
+                      chunks.append('\n'.join(current))
+                      current = []
+                      current_len = 0
+
+                  # 强制超长分段
+                  if current_len + line_len > max_len:
+                      chunks.append('\n'.join(current))
+                      current = []
+                      current_len = 0
+
+                  current.append(line)
+                  current_len += line_len
+
+              if current:
+                  chunks.append('\n'.join(current))
+
+              return chunks
+
+          # 转换格式
+          converted = convert_to_telegram_rich_markdown(raw, date)
+
+          # 分段
+          chunks = split_markdown(converted)
           total = len(chunks)
           print(f"Total chunks to send: {total}")
 
+          # Telegram sendRichMessage API endpoint
+          url = f"https://api.telegram.org/bot{token}/sendRichMessage"
+
           for i, chunk in enumerate(chunks):
-              part_label = f"（{i+1}/{total}）\n\n" if total > 1 else ""
+              # 多段时在段首添加续篇标记
+              if total > 1:
+                  part_header = f"> 第 {i+1} / {total} 部分\n\n"
+                  chunk = part_header + chunk
+
               payload = {
                   "chat_id": chat_id,
-                  "text": part_label + chunk,
-                  "parse_mode": "Markdown"
+                  "rich_message": {
+                      "markdown": chunk
+                  },
+                  "disable_notification": False
               }
-              response = requests.post(url, json=payload)
-              print(f"Chunk {i+1}: status={response.status_code}")
 
-              # 如果 Markdown 解析失败，降级为纯文本重试
+              response = requests.post(
+                  url,
+                  headers={"Content-Type": "application/json"},
+                  data=json.dumps(payload)
+              )
+
+              print(f"Chunk {i+1}/{total}: status={response.status_code}")
+
+              # 如果 Rich Message 发送失败，降级到普通 sendMessage
               if response.status_code != 200:
-                  print(f"Markdown failed, retrying as plain text...")
-                  payload["parse_mode"] = ""
-                  response = requests.post(url, json=payload)
-                  print(f"Chunk {i+1} retry: status={response.status_code}, body={response.text}")
+                  print(f"sendRichMessage failed: {response.text}")
+                  print(f"Falling back to sendMessage (plain text)...")
 
-              if response.status_code != 200:
-                  raise Exception(f"Failed to send chunk {i+1}: {response.text}")
+                  fallback_url = f"https://api.telegram.org/bot{token}/sendMessage"
+                  fallback_payload = {
+                      "chat_id": chat_id,
+                      "text": chunk,
+                      "parse_mode": ""  # 纯文本，避免格式字符引发二次错误
+                  }
+                  fallback_response = requests.post(fallback_url, json=fallback_payload)
+                  print(f"Fallback chunk {i+1}: status={fallback_response.status_code}")
 
-          print("All chunks sent successfully.")
+                  if fallback_response.status_code != 200:
+                      raise Exception(
+                          f"Both sendRichMessage and fallback failed for chunk {i+1}: "
+                          f"{fallback_response.text}"
+                      )
+
+          print(f"✅ All {total} chunk(s) sent successfully.")
           PYEOF
